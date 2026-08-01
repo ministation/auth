@@ -50,11 +50,14 @@ pytest -q
 
 Роли «Авторизован» на Мини + Оазис: `GUILD_ID` / `AUTH_DISCORD_ROLE_ID` и `GUILD2_ID` / `AUTH_DISCORD_ROLE_ID_2` (при необходимости `GUILD2_BOT_TOKEN`).
 
-Бэкфилл уже привязанных аккаунтов:
+Бэкфилл уже привязанных аккаунтов (только тем, кто уже на целевом Discord):
 
 ```bash
-python scripts/sync_auth_roles.py --only-guild 1381238425260134440
+python scripts/sync_auth_roles.py --only-guild 1381238425260134440 --diagnose
+python scripts/sync_auth_roles.py --only-guild 1381238425260134440 --reset-state
 ```
+
+Для списка участников боту нужен privileged **Server Members Intent**.
 
 ## API
 

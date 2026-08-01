@@ -4,14 +4,12 @@
 """
 Backfill Discord «Авторизован» roles for accounts already in discord_auth.
 
-Usage (from repo root):
-  python scripts/sync_auth_roles.py --only-guild 1381238425260134440
-  python scripts/sync_auth_roles.py --only-guild 1381238425260134440 --resume
-  python scripts/sync_auth_roles.py --dry-run
+Recommended (Oasis):
+  python scripts/sync_auth_roles.py --only-guild 1381238425260134440 --diagnose
+  python scripts/sync_auth_roles.py --only-guild 1381238425260134440 --reset-state
 
-Notes:
-  - «not_member» = user is not on that Discord server (normal for Oasis backfill).
-  - 429 is retried automatically; raise --delay if Discord still throttles.
+By default the script lists actual guild members, intersects with discord_auth,
+and only assigns to people who are ON that Discord server.
 """
 
 from __future__ import annotations
@@ -28,7 +26,7 @@ if str(ROOT) not in sys.path:
 
 from db.database import init_db  # noqa: E402
 from db.multi import list_linked_discord_ids  # noqa: E402
-from discord_client import DiscordClient  # noqa: E402
+from discord_client import DiscordApiError, DiscordClient  # noqa: E402
 from settings import get_settings  # noqa: E402
 
 
@@ -39,10 +37,13 @@ async def run(
     delay: float,
     resume: bool,
     reset_state: bool,
+    diagnose: bool,
+    brute: bool,
 ) -> int:
     settings = get_settings()
     init_db()
-    ids = list_linked_discord_ids()
+    linked = [str(i) for i in list_linked_discord_ids()]
+    linked_set = set(linked)
     targets = settings.auth_roles
     if only_guild:
         targets = [t for t in targets if t.guild_id == only_guild]
@@ -50,9 +51,7 @@ async def run(
         print("No auth role targets configured (check AUTH_DISCORD_ROLES / GUILD2_*).")
         return 1
 
-    state_file = ROOT / (
-        f".sync_auth_roles_{only_guild or 'all'}.json"
-    )
+    state_file = ROOT / f".sync_auth_roles_{only_guild or 'all'}.json"
     done: set[str] = set()
     if reset_state and state_file.exists():
         state_file.unlink()
@@ -65,16 +64,8 @@ async def run(
         except Exception as exc:  # noqa: BLE001
             print(f"Could not read state file: {exc}")
 
-    pending = [i for i in ids if str(i) not in done]
-    print(f"Linked Discord IDs: {len(ids)} (pending {len(pending)})")
+    print(f"Linked in discord_auth: {len(linked)}")
     print("Targets: " + ", ".join(f"{t.guild_id}:{t.role_id}" for t in targets))
-    print("not_member = user is not on the target Discord (skip, expected).")
-    if dry_run:
-        print("Dry run — no Discord API writes.")
-        return 0
-    if not pending:
-        print("Nothing to do.")
-        return 0
 
     discord = DiscordClient(
         client_id=settings.client_id,
@@ -84,84 +75,135 @@ async def run(
         auth_roles=[(t.guild_id, t.role_id, t.bot_token) for t in targets],
     )
     await discord.start()
-    counts: dict[str, int] = {}
-    try:
-        for i, discord_id in enumerate(pending, start=1):
-            results = await discord.assign_auth_role(
-                str(discord_id),
-                only_guild_ids=[t.guild_id for t in targets],
-                quiet_not_member=True,
-            )
-            for guild_id, status in results.items():
-                key = f"{status}"
-                counts[key] = counts.get(key, 0) + 1
-                if status == "ok":
-                    print(f"  ok  {discord_id} @ {guild_id}")
-                elif status not in ("not_member",):
-                    print(f"  {status}  {discord_id} @ {guild_id}")
 
-            done.add(str(discord_id))
-            if i % 20 == 0 or i == len(pending):
-                state_file.write_text(
-                    json.dumps({"done": sorted(done)}, ensure_ascii=True),
-                    encoding="utf-8",
-                )
+    # per guild_id -> discord ids to assign
+    work: dict[str, list[str]] = {}
+
+    try:
+        for target in targets:
+            guild_id = target.guild_id
+            try:
+                guild = await discord.fetch_guild(guild_id)
+            except DiscordApiError as exc:
+                print(f"\nGuild {guild_id}: ERROR — {exc}")
+                print("Check GUILD2_ID / GUILD2_BOT_TOKEN and that the bot is invited.")
+                return 1
+
+            name = guild.get("name", "?")
+            approx = guild.get("approximate_member_count")
+            print(f"\nGuild {guild_id} «{name}» approx_members={approx}")
+
+            if brute:
+                ids = [i for i in linked if f"{guild_id}:{i}" not in done and i not in done]
+                print(f"Brute mode: will probe {len(ids)} linked IDs")
+                work[guild_id] = ids
+                continue
+
+            try:
+                member_ids = await discord.list_guild_member_ids(guild_id)
+            except DiscordApiError as exc:
+                print(f"Cannot list members: {exc}")
                 print(
-                    f"… {i}/{len(pending)}  "
-                    + " ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+                    "\nEnable Server Members Intent:\n"
+                    "  Discord Developer Portal → Oasis bot application → Bot\n"
+                    "  → Privileged Gateway Intents → Server Members Intent = ON → Save\n"
+                    "Wait ~1 minute, then re-run.\n"
+                    "Or pass --brute to probe each linked id (slow)."
                 )
-            if delay > 0:
-                await asyncio.sleep(delay)
-    except KeyboardInterrupt:
+                return 2
+
+            overlap = sorted(linked_set & member_ids)
+            print(f"Members visible to bot: {len(member_ids)}")
+            print(f"Overlap with discord_auth: {len(overlap)}")
+            if overlap:
+                print("Sample overlap IDs: " + ", ".join(overlap[:8]))
+            else:
+                print(
+                    "No overlap: nobody from discord_auth is currently on this Discord.\n"
+                    "Backfill cannot invent membership — they must join Oasis first.\n"
+                    "After join, next site/game login (or re-run sync) grants the role."
+                )
+            work[guild_id] = [i for i in overlap if i not in done]
+
+        total = sum(len(v) for v in work.values())
+        if diagnose:
+            print(f"\nDiagnose only — {total} user(s) would get a role.")
+            return 0
+        if dry_run:
+            print(f"\nDry run — would assign to {total} user(s).")
+            return 0
+        if total == 0:
+            print("\nNothing to assign.")
+            return 0
+
+        print(f"\nAssigning roles to {total} member(s)…")
+        counts: dict[str, int] = {}
+        processed = 0
+        try:
+            for guild_id, ids in work.items():
+                for discord_id in ids:
+                    processed += 1
+                    results = await discord.assign_auth_role(
+                        discord_id,
+                        only_guild_ids=[guild_id],
+                        quiet_not_member=True,
+                    )
+                    for gid, status in results.items():
+                        counts[status] = counts.get(status, 0) + 1
+                        if status == "ok":
+                            print(f"  ok  {discord_id} @ {gid}")
+                        elif status != "not_member":
+                            print(f"  {status}  {discord_id} @ {gid}")
+
+                    done.add(discord_id)
+                    if processed % 20 == 0 or processed == total:
+                        state_file.write_text(
+                            json.dumps({"done": sorted(done)}, ensure_ascii=True),
+                            encoding="utf-8",
+                        )
+                        print(
+                            f"… {processed}/{total}  "
+                            + " ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+                        )
+                    if delay > 0:
+                        await asyncio.sleep(delay)
+        except KeyboardInterrupt:
+            state_file.write_text(
+                json.dumps({"done": sorted(done)}, ensure_ascii=True),
+                encoding="utf-8",
+            )
+            print(f"\nInterrupted. Progress saved to {state_file.name}")
+            print(
+                "Continue with: python scripts/sync_auth_roles.py --resume "
+                + (f"--only-guild {only_guild}" if only_guild else "")
+            )
+            return 130
+
         state_file.write_text(
             json.dumps({"done": sorted(done)}, ensure_ascii=True),
             encoding="utf-8",
         )
-        print(f"\nInterrupted. Progress saved to {state_file.name}")
-        print("Continue with: python scripts/sync_auth_roles.py --resume "
-              + (f"--only-guild {only_guild}" if only_guild else ""))
-        return 130
+        print("Summary:")
+        for key, n in sorted(counts.items()):
+            print(f"  {key}: {n}")
+        return 0
     finally:
         await discord.stop()
-
-    state_file.write_text(
-        json.dumps({"done": sorted(done)}, ensure_ascii=True),
-        encoding="utf-8",
-    )
-    print("Summary:")
-    for key, n in sorted(counts.items()):
-        print(f"  {key}: {n}")
-    print(
-        "Hint: not_member means they never joined Oasis — invite/join first, "
-        "then role is granted on next login or re-run."
-    )
-    return 0
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Sync Discord auth roles for linked users")
-    parser.add_argument(
-        "--only-guild",
-        default="",
-        help="Only assign on this guild id (e.g. Oasis)",
-    )
+    parser.add_argument("--only-guild", default="", help="Only this guild id (Oasis)")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--diagnose", action="store_true", help="Only show guild/overlap stats")
     parser.add_argument(
-        "--delay",
-        type=float,
-        default=0.9,
-        help="Seconds between users (default 0.9; raise if 429 persists)",
-    )
-    parser.add_argument(
-        "--resume",
+        "--brute",
         action="store_true",
-        help="Skip Discord IDs already recorded in the state file",
+        help="Probe every linked id (old behaviour); ignore member list",
     )
-    parser.add_argument(
-        "--reset-state",
-        action="store_true",
-        help="Clear resume state before starting",
-    )
+    parser.add_argument("--delay", type=float, default=0.9)
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--reset-state", action="store_true")
     args = parser.parse_args()
     raise SystemExit(
         asyncio.run(
@@ -171,6 +213,8 @@ def main() -> None:
                 delay=max(0.0, args.delay),
                 resume=args.resume,
                 reset_state=args.reset_state,
+                diagnose=args.diagnose,
+                brute=args.brute,
             )
         )
     )

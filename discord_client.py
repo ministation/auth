@@ -147,6 +147,72 @@ class DiscordClient:
                 return token
         return self.bot_token
 
+    async def fetch_guild(self, guild_id: str) -> dict[str, Any]:
+        token = self._token_for_guild(guild_id)
+        if not token:
+            raise DiscordApiError("No bot token for guild")
+        resp = await self.http.get(
+            f"{DISCORD_API}/guilds/{guild_id}?with_counts=true",
+            headers={"Authorization": f"Bot {token}"},
+        )
+        if resp.status_code != 200:
+            raise DiscordApiError(
+                f"Cannot read guild {guild_id}: HTTP {resp.status_code} {resp.text[:200]}"
+            )
+        data = resp.json()
+        if not isinstance(data, dict):
+            raise DiscordApiError("Invalid guild response")
+        return data
+
+    async def list_guild_member_ids(self, guild_id: str) -> set[str]:
+        """
+        Paginate GET /guilds/{id}/members.
+        Requires Server Members Intent enabled for the bot application.
+        """
+        token = self._token_for_guild(guild_id)
+        if not token:
+            raise DiscordApiError("No bot token for guild")
+        headers = {"Authorization": f"Bot {token}"}
+        after = "0"
+        members: set[str] = set()
+        while True:
+            resp = await self.http.get(
+                f"{DISCORD_API}/guilds/{guild_id}/members",
+                params={"limit": 1000, "after": after},
+                headers=headers,
+            )
+            if resp.status_code == 429:
+                retry_after = 1.0
+                try:
+                    retry_after = float(resp.json().get("retry_after", 1.0))
+                except Exception:
+                    retry_after = float(resp.headers.get("Retry-After", "1") or 1)
+                await asyncio.sleep(max(0.25, retry_after) + 0.15)
+                continue
+            if resp.status_code == 403:
+                raise DiscordApiError(
+                    "Cannot list guild members (HTTP 403). Enable privileged "
+                    "Server Members Intent for this bot in Discord Developer Portal, "
+                    "then restart the bot / wait a minute."
+                )
+            if resp.status_code != 200:
+                raise DiscordApiError(
+                    f"Cannot list members for {guild_id}: HTTP {resp.status_code} {resp.text[:200]}"
+                )
+            batch = resp.json()
+            if not isinstance(batch, list) or not batch:
+                break
+            for row in batch:
+                user = row.get("user") or {}
+                uid = str(user.get("id", ""))
+                if uid.isdigit():
+                    members.add(uid)
+                    after = uid
+            if len(batch) < 1000:
+                break
+            await asyncio.sleep(0.35)
+        return members
+
     async def assign_auth_role(
         self,
         discord_id: str,

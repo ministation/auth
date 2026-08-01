@@ -1,6 +1,6 @@
 [project]
 name = "discord-auth-ss14"
-version = "1.4.4"
+version = "1.4.5"
 description = "Discord linking service for Мини-станция / Space Station 14"
 readme = "README.md"
 requires-python = ">=3.11"
