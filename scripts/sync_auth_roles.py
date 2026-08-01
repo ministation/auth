@@ -66,6 +66,12 @@ async def run(
 
     print(f"Linked in discord_auth: {len(linked)}")
     print("Targets: " + ", ".join(f"{t.guild_id}:{t.role_id}" for t in targets))
+    for t in targets:
+        same = t.bot_token == settings.bot_token
+        print(
+            f"  bot for {t.guild_id}: "
+            + ("primary BOT_TOKEN" if same else "separate GUILD*_BOT_TOKEN")
+        )
 
     discord = DiscordClient(
         client_id=settings.client_id,

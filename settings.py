@@ -144,7 +144,12 @@ def _guild_bot_token(index: int | None, guild_id: str, default_token: str) -> st
     """Optional per-guild bot: GUILD2_BOT_TOKEN / GUILD{N}_BOT_TOKEN / BOT_TOKEN_<guildId>."""
     if index is not None:
         if index >= 2:
-            specific = os.getenv(f"GUILD{index}_BOT_TOKEN", "").strip()
+            specific = (
+                os.getenv(f"GUILD{index}_BOT_TOKEN", "").strip()
+                # alias used on some deploys / token_site naming
+                or (os.getenv("DISCORD_GUILD2_BOT_TOKEN", "").strip() if index == 2 else "")
+                or (os.getenv("DISCORD_GUILD_BOT_TOKEN_2", "").strip() if index == 2 else "")
+            )
             if specific:
                 return specific
         elif index == 1:
@@ -154,6 +159,15 @@ def _guild_bot_token(index: int | None, guild_id: str, default_token: str) -> st
     by_id = os.getenv(f"BOT_TOKEN_{guild_id}", "").strip()
     if by_id:
         return by_id
+    # Last-chance aliases when GUILD2 was loaded via AUTH_DISCORD_ROLES index
+    if guild_id and guild_id == os.getenv("GUILD2_ID", "").strip():
+        alias = (
+            os.getenv("GUILD2_BOT_TOKEN", "").strip()
+            or os.getenv("DISCORD_GUILD2_BOT_TOKEN", "").strip()
+            or os.getenv("DISCORD_GUILD_BOT_TOKEN_2", "").strip()
+        )
+        if alias:
+            return alias
     return default_token
 
 
