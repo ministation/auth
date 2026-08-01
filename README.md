@@ -15,9 +15,13 @@
 
 ## Быстрый старт
 
+Рекомендуется **Python 3.11 или 3.12** (на 3.14 часть пакетов ещё без готовых wheel).
+
 ```bash
 cp .env.example .env
 # заполните .env
+python3.12 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 python discord_auth_server.py
 ```

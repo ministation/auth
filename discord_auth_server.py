@@ -12,7 +12,7 @@ import uuid
 from contextlib import asynccontextmanager
 from urllib.parse import urlencode
 
-import qrcode
+import segno
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, RedirectResponse
@@ -76,9 +76,9 @@ def _oauth_url(settings: Settings, user_id: uuid.UUID) -> str:
 
 
 def _qr_png_base64(url: str) -> str:
-    img = qrcode.make(url)
+    # segno writes PNG without Pillow / system jpeg libs.
     buf = io.BytesIO()
-    img.save(buf, format="PNG")
+    segno.make(url, error="m").save(buf, kind="png", scale=6)
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
