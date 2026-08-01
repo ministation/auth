@@ -25,7 +25,7 @@ class DiscordClient:
         client_secret: str,
         redirect_uri: str,
         bot_token: str,
-        auth_roles: Sequence[tuple[str, str]] = (),
+        auth_roles: Sequence[tuple[str, str, str]] | Sequence[tuple[str, str]] = (),
         # Back-compat: primary guild used when auth_roles empty
         guild_id: str = "",
         auth_role_id: str | None = None,
@@ -35,16 +35,24 @@ class DiscordClient:
         self.redirect_uri = redirect_uri
         self.bot_token = bot_token
 
-        roles = [(g, r) for g, r in auth_roles if g and r]
+        roles: list[tuple[str, str, str]] = []
+        for item in auth_roles:
+            if len(item) == 3:
+                g, r, t = item  # type: ignore[misc]
+                roles.append((str(g), str(r), str(t or bot_token)))
+            elif len(item) == 2:
+                g, r = item  # type: ignore[misc]
+                roles.append((str(g), str(r), bot_token))
         if not roles and guild_id and auth_role_id:
-            roles = [(guild_id, auth_role_id)]
-        self.auth_roles: list[tuple[str, str]] = roles
-        self.guild_ids: list[str] = list(dict.fromkeys(g for g, _ in roles))
+            roles = [(guild_id, auth_role_id, bot_token)]
+        self.auth_roles: list[tuple[str, str, str]] = [
+            (g, r, t) for g, r, t in roles if g and r and t
+        ]
+        self.guild_ids: list[str] = list(dict.fromkeys(g for g, _, _ in self.auth_roles))
         if guild_id and guild_id not in self.guild_ids:
             self.guild_ids.insert(0, guild_id)
-        # Primary guild (first configured) — used by older call sites / logs
         self.guild_id = self.guild_ids[0] if self.guild_ids else guild_id
-        self.auth_role_id = roles[0][1] if roles else auth_role_id
+        self.auth_role_id = self.auth_roles[0][1] if self.auth_roles else auth_role_id
         self._http: httpx.AsyncClient | None = None
 
     async def start(self) -> None:
@@ -106,11 +114,12 @@ class DiscordClient:
     async def is_guild_member(self, discord_id: str, guild_id: str | None = None) -> bool | None:
         """True/False if known, None if bot check unavailable."""
         target = guild_id or self.guild_id
-        if not target or not self.bot_token:
+        token = self._token_for_guild(target)
+        if not target or not token:
             return None
         resp = await self.http.get(
             f"{DISCORD_API}/guilds/{target}/members/{discord_id}",
-            headers={"Authorization": f"Bot {self.bot_token}"},
+            headers={"Authorization": f"Bot {token}"},
         )
         if resp.status_code == 200:
             return True
@@ -131,16 +140,42 @@ class DiscordClient:
             return False
         return None
 
-    async def assign_auth_role(self, discord_id: str) -> None:
-        """Assign auth role on every configured guild. Failures are logged, not raised."""
-        if not self.bot_token or not self.auth_roles:
-            return
-        headers = {"Authorization": f"Bot {self.bot_token}"}
-        for guild_id, role_id in self.auth_roles:
+    def _token_for_guild(self, guild_id: str) -> str:
+        for g, _r, token in self.auth_roles:
+            if g == guild_id and token:
+                return token
+        return self.bot_token
+
+    async def assign_auth_role(
+        self,
+        discord_id: str,
+        *,
+        only_guild_ids: Sequence[str] | None = None,
+    ) -> dict[str, str]:
+        """
+        Assign auth role on configured guilds.
+
+        Returns map guild_id -> status (ok / skip / http_NNN / error).
+        Failures are logged, not raised.
+        """
+        results: dict[str, str] = {}
+        if not self.auth_roles:
+            return results
+        allow = set(only_guild_ids) if only_guild_ids else None
+        for guild_id, role_id, token in self.auth_roles:
+            if allow is not None and guild_id not in allow:
+                continue
+            if not token:
+                results[guild_id] = "skip_no_token"
+                continue
             url = f"{DISCORD_API}/guilds/{guild_id}/members/{discord_id}/roles/{role_id}"
             try:
-                resp = await self.http.put(url, headers=headers)
+                resp = await self.http.put(
+                    url,
+                    headers={"Authorization": f"Bot {token}"},
+                )
                 if resp.status_code in (200, 204):
+                    results[guild_id] = "ok"
                     logger.info(
                         "Assigned auth role %s to %s on guild %s",
                         role_id,
@@ -148,14 +183,15 @@ class DiscordClient:
                         guild_id,
                     )
                 elif resp.status_code == 404:
+                    results[guild_id] = "not_member"
                     logger.warning(
-                        "Cannot assign role %s on guild %s for %s: member not found "
-                        "(user not on server, or bot missing)",
+                        "Cannot assign role %s on guild %s for %s: member not found",
                         role_id,
                         guild_id,
                         discord_id,
                     )
                 else:
+                    results[guild_id] = f"http_{resp.status_code}"
                     logger.warning(
                         "Failed to assign role %s on guild %s for %s: HTTP %s %s",
                         role_id,
@@ -165,12 +201,14 @@ class DiscordClient:
                         resp.text[:200],
                     )
             except Exception:
+                results[guild_id] = "error"
                 logger.exception(
                     "Error assigning role %s on guild %s for %s",
                     role_id,
                     guild_id,
                     discord_id,
                 )
+        return results
 
 
 class DiscordApiError(Exception):

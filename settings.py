@@ -112,10 +112,11 @@ def _load_databases() -> list[DatabaseConfig]:
 
 @dataclass(frozen=True)
 class GuildRoleTarget:
-    """Discord guild + auth role to assign after successful SS14 link."""
+    """Discord guild + auth role to assign after successful SS14 / site login."""
 
     guild_id: str
     role_id: str
+    bot_token: str = ""  # empty → use Settings.bot_token
 
 
 def _parse_snowflake_pairs(raw: str) -> list[tuple[str, str]]:
@@ -139,21 +140,39 @@ def _parse_snowflake_pairs(raw: str) -> list[tuple[str, str]]:
     return pairs
 
 
-def _load_auth_roles() -> list[GuildRoleTarget]:
+def _guild_bot_token(index: int | None, guild_id: str, default_token: str) -> str:
+    """Optional per-guild bot: GUILD2_BOT_TOKEN / GUILD{N}_BOT_TOKEN / BOT_TOKEN_<guildId>."""
+    if index is not None:
+        if index >= 2:
+            specific = os.getenv(f"GUILD{index}_BOT_TOKEN", "").strip()
+            if specific:
+                return specific
+        elif index == 1:
+            specific = os.getenv("GUILD_BOT_TOKEN", "").strip() or os.getenv("GUILD1_BOT_TOKEN", "").strip()
+            if specific:
+                return specific
+    by_id = os.getenv(f"BOT_TOKEN_{guild_id}", "").strip()
+    if by_id:
+        return by_id
+    return default_token
+
+
+def _load_auth_roles(*, default_bot_token: str) -> list[GuildRoleTarget]:
     """
     Role targets on one or more Discord servers.
 
     Preferred:
       AUTH_DISCORD_ROLES=guild1:role1,guild2:role2
 
-    Legacy / extra pairs also accepted:
+    Also accepted:
       GUILD_ID + AUTH_DISCORD_ROLE_ID
       GUILD2_ID + AUTH_DISCORD_ROLE_ID_2
+      GUILD2_BOT_TOKEN — bot that can Manage Roles on the second guild
     """
     seen: set[tuple[str, str]] = set()
     targets: list[GuildRoleTarget] = []
 
-    def add(guild_id: str, role_id: str) -> None:
+    def add(guild_id: str, role_id: str, *, index: int | None = None) -> None:
         guild_id, role_id = guild_id.strip(), role_id.strip()
         if not guild_id or not role_id:
             return
@@ -163,17 +182,19 @@ def _load_auth_roles() -> list[GuildRoleTarget]:
         if not guild_id.isdigit() or not role_id.isdigit():
             raise RuntimeError(f"Invalid guild/role snowflake: {guild_id}/{role_id}")
         seen.add(key)
-        targets.append(GuildRoleTarget(guild_id=guild_id, role_id=role_id))
+        token = _guild_bot_token(index, guild_id, default_bot_token)
+        targets.append(
+            GuildRoleTarget(guild_id=guild_id, role_id=role_id, bot_token=token)
+        )
 
     roles_raw = os.getenv("AUTH_DISCORD_ROLES", "").strip()
     if roles_raw:
-        for guild_id, role_id in _parse_snowflake_pairs(roles_raw):
-            add(guild_id, role_id)
+        for i, (guild_id, role_id) in enumerate(_parse_snowflake_pairs(roles_raw), start=1):
+            add(guild_id, role_id, index=i)
 
-    add(os.getenv("GUILD_ID", ""), os.getenv("AUTH_DISCORD_ROLE_ID", ""))
-    add(os.getenv("GUILD2_ID", ""), os.getenv("AUTH_DISCORD_ROLE_ID_2", ""))
+    add(os.getenv("GUILD_ID", ""), os.getenv("AUTH_DISCORD_ROLE_ID", ""), index=1)
+    add(os.getenv("GUILD2_ID", ""), os.getenv("AUTH_DISCORD_ROLE_ID_2", ""), index=2)
 
-    # Extra GUILD{N}_ID / AUTH_DISCORD_ROLE_ID_{N} for N>=3
     for key in list(os.environ):
         match = re.match(r"^GUILD(\d+)_ID$", key, re.IGNORECASE)
         if not match:
@@ -181,10 +202,9 @@ def _load_auth_roles() -> list[GuildRoleTarget]:
         n = int(match.group(1))
         if n < 3:
             continue
-        add(os.getenv(key, ""), os.getenv(f"AUTH_DISCORD_ROLE_ID_{n}", ""))
+        add(os.getenv(key, ""), os.getenv(f"AUTH_DISCORD_ROLE_ID_{n}", ""), index=n)
 
     return targets
-
 
 @dataclass(frozen=True)
 class Settings:
@@ -228,7 +248,8 @@ def get_settings() -> Settings:
     ):
         raise RuntimeError("REDIRECT_URI must be an http(s) URL")
 
-    auth_roles = _load_auth_roles()
+    bot_token = _env("BOT_TOKEN")
+    auth_roles = _load_auth_roles(default_bot_token=bot_token)
     guild_id = os.getenv("GUILD_ID", "").strip()
     if not guild_id and auth_roles:
         guild_id = auth_roles[0].guild_id
@@ -236,18 +257,18 @@ def get_settings() -> Settings:
     if role_id is None and auth_roles:
         role_id = auth_roles[0].role_id
 
-    required_guild_ids = list(dict.fromkeys(
-        [*(t.guild_id for t in auth_roles), *([guild_id] if guild_id else [])]
-    ))
-    # Optional: REQUIRE_GUILD_IDS=id1,id2 overrides membership check set
+    # Membership gate defaults to primary Mini guild only (not every role target).
+    required_guild_ids = [guild_id] if guild_id else []
     require_raw = os.getenv("REQUIRE_GUILD_IDS", "").strip()
     if require_raw:
         required_guild_ids = [
             g.strip() for g in re.split(r"[\s,;]+", require_raw) if g.strip().isdigit()
         ]
+    elif not required_guild_ids and auth_roles:
+        required_guild_ids = [auth_roles[0].guild_id]
 
     return Settings(
-        bot_token=_env("BOT_TOKEN"),
+        bot_token=bot_token,
         api_key=_require_min_len("API_KEY", _env("API_KEY"), 8),
         client_id=_env("CLIENT_ID"),
         client_secret=_env("CLIENT_SECRET"),

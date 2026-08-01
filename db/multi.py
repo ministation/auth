@@ -51,6 +51,23 @@ def ping_databases() -> dict[str, bool]:
     return result
 
 
+def list_linked_discord_ids() -> list[int]:
+    """Unique Discord IDs linked in any configured database (union)."""
+    found: set[int] = set()
+    for name in database_names():
+        try:
+            with get_session(name) as session:
+                rows = session.execute(
+                    text("SELECT discord_id FROM discord_auth WHERE discord_id IS NOT NULL")
+                ).fetchall()
+                for (discord_id,) in rows:
+                    if discord_id is not None:
+                        found.add(int(discord_id))
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to list discord_ids from %s", name)
+    return sorted(found)
+
+
 def link_account_all(user_id: uuid.UUID, discord_id: int) -> list[str]:
     """
     Write the same Discord <-> SS14 link into every configured database.

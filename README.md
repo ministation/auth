@@ -48,6 +48,14 @@ pytest -q
 
 См. `.env.example`. Обязательно одинаковый `GAME_AUTH_SECRET` на этом сервисе и на сайте (`token_site`).
 
+Роли «Авторизован» на Мини + Оазис: `GUILD_ID` / `AUTH_DISCORD_ROLE_ID` и `GUILD2_ID` / `AUTH_DISCORD_ROLE_ID_2` (при необходимости `GUILD2_BOT_TOKEN`).
+
+Бэкфилл уже привязанных аккаунтов:
+
+```bash
+python scripts/sync_auth_roles.py --only-guild 1381238425260134440
+```
+
 ## API
 
 | Метод | Путь | Назначение |

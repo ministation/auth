@@ -33,7 +33,7 @@ from security import (
 )
 from settings import Settings, get_settings
 
-__version__ = "1.4.2"
+__version__ = "1.4.3"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -145,7 +145,7 @@ async def lifespan(app: FastAPI):
         client_secret=settings.client_secret,
         redirect_uri=settings.redirect_uri,
         bot_token=settings.bot_token,
-        auth_roles=[(t.guild_id, t.role_id) for t in settings.auth_roles],
+        auth_roles=[(t.guild_id, t.role_id, t.bot_token) for t in settings.auth_roles],
         guild_id=settings.guild_id,
         auth_role_id=settings.auth_discord_role_id,
     )
