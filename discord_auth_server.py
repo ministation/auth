@@ -1,256 +1,300 @@
+# Copyright (c) 2024–2026 Мини-станция (Mini-Station). All rights reserved.
+# See LICENSE for terms.
+
 """SS14 Discord auth service (Corvax-compatible API) with ministation.ru handoff."""
 
 from __future__ import annotations
 
+import base64
 import io
 import logging
 import uuid
-from typing import Any
+from contextlib import asynccontextmanager
 from urllib.parse import urlencode
 
-import httpx
 import qrcode
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse, RedirectResponse
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse, RedirectResponse
 
-from config_loader import load_settings
 from db import init_db
 from db.crud import LinkConflictError
-from db.multi import is_linked_any, link_account_all
-from site_login import create_site_login_token
+from db.multi import is_linked_any, link_account_all, ping_databases
+from discord_client import DiscordApiError, DiscordClient, OAUTH_AUTHORIZE
+from middleware import SecurityHeadersMiddleware
+from pages import error_page, success_page
+from rate_limit import limiter
+from schemas import AuthInfoResponse, HealthResponse, LinkResponse
+from security import (
+    api_key_valid,
+    create_oauth_state,
+    create_site_login_token,
+    parse_oauth_state,
+)
+from settings import Settings, get_settings
 
-logging.basicConfig(level=logging.INFO)
+__version__ = "1.4.0"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
 logger = logging.getLogger("discord_auth")
 
-settings = load_settings()
 
-BOT_TOKEN = settings.bot_token
-API_KEY = settings.api_key
-CLIENT_ID = settings.client_id
-CLIENT_SECRET = settings.client_secret
-REDIRECT_URI = settings.redirect_uri
-GUILD_ID = settings.guild_id
-AUTH_DISCORD_ROLE_ID = settings.auth_discord_role_id
-SITE_PUBLIC_URL = settings.site_public_url
-SITE_LOGIN_PATH = settings.site_login_path
-GAME_AUTH_SECRET = settings.game_auth_secret
-REQUIRE_GUILD = settings.require_guild
-
-DISCORD_API = "https://discord.com/api/v10"
-OAUTH_AUTHORIZE = "https://discord.com/api/oauth2/authorize"
-OAUTH_TOKEN = "https://discord.com/api/oauth2/token"
-
-app = FastAPI(title="SS14 Discord Auth", version="1.1.0")
-
-
-class LinkResponse(BaseModel):
-    Url: str
-    Qrcode: str
-
-
-class AuthInfoResponse(BaseModel):
-    IsLinked: bool
+def _client_ip(request: Request) -> str:
+    settings: Settings = request.app.state.settings
+    if settings.trust_proxy:
+        forwarded = request.headers.get("x-forwarded-for", "")
+        if forwarded:
+            return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
 
 
 def _parse_user_id(raw: str) -> uuid.UUID:
     try:
-        return uuid.UUID(raw)
+        return uuid.UUID(str(raw))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="Invalid user_id") from exc
 
 
-def _oauth_url(user_id: uuid.UUID) -> str:
-    params = {
-        "client_id": CLIENT_ID,
-        "redirect_uri": REDIRECT_URI,
-        "response_type": "code",
-        "scope": "identify guilds",
-        "state": str(user_id),
-        "prompt": "consent",
-    }
-    return f"{OAUTH_AUTHORIZE}?{urlencode(params)}"
+def _oauth_url(settings: Settings, user_id: uuid.UUID) -> str:
+    state = create_oauth_state(secret=settings.game_auth_secret, user_id=str(user_id))
+    return (
+        f"{OAUTH_AUTHORIZE}?"
+        + urlencode(
+            {
+                "client_id": settings.client_id,
+                "redirect_uri": settings.redirect_uri,
+                "response_type": "code",
+                "scope": "identify guilds",
+                "state": state,
+                "prompt": "consent",
+            }
+        )
+    )
 
 
 def _qr_png_base64(url: str) -> str:
-    import base64
-
     img = qrcode.make(url)
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
-def _require_api_key(key: str) -> None:
-    import hmac as _hmac
+def _page(settings: Settings, title: str, message: str, status_code: int = 400):
+    return error_page(title, message, site_url=settings.site_public_url, status_code=status_code)
 
-    if not key or not _hmac.compare_digest(key.encode("utf-8"), API_KEY.encode("utf-8")):
+
+def _require_api_key(settings: Settings, key: str | None) -> None:
+    if not api_key_valid(key, settings.api_key):
         raise HTTPException(status_code=403, detail="Invalid API key")
 
 
-@app.on_event("startup")
-def on_startup() -> None:
-    init_db()
-    logger.info("Databases: %s", ", ".join(db.name for db in settings.databases))
+async def _ensure_required_guild(
+    *,
+    settings: Settings,
+    discord: DiscordClient,
+    access_token: str,
+    discord_id: str,
+):
+    if not settings.require_guild:
+        return None
+    if not settings.guild_id:
+        return _page(settings, "Конфигурация", "REQUIRE_GUILD включён, но GUILD_ID не задан", 500)
 
+    try:
+        guilds = await discord.fetch_guilds(access_token)
+        if any(str(g.get("id")) == settings.guild_id for g in guilds):
+            return None
 
-async def _exchange_code(code: str) -> str:
-    data = {
-        "client_id": CLIENT_ID,
-        "client_secret": CLIENT_SECRET,
-        "grant_type": "authorization_code",
-        "code": code,
-        "redirect_uri": REDIRECT_URI,
-    }
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        resp = await client.post(
-            OAUTH_TOKEN,
-            data=data,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
-        if resp.status_code != 200:
-            raise HTTPException(status_code=400, detail=f"Token exchange failed: {resp.text}")
-        payload = resp.json()
-        token = payload.get("access_token")
-        if not token:
-            raise HTTPException(status_code=400, detail="No access_token from Discord")
-        return token
-
-
-async def _fetch_discord_user(access_token: str) -> dict[str, Any]:
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        resp = await client.get(
-            f"{DISCORD_API}/users/@me",
-            headers={"Authorization": f"Bearer {access_token}"},
-        )
-        if resp.status_code != 200:
-            raise HTTPException(status_code=400, detail="Failed to fetch Discord user")
-        return resp.json()
-
-
-async def _fetch_user_guilds(access_token: str) -> list[dict[str, Any]]:
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        resp = await client.get(
-            f"{DISCORD_API}/users/@me/guilds",
-            headers={"Authorization": f"Bearer {access_token}"},
-        )
-        if resp.status_code != 200:
-            raise HTTPException(status_code=400, detail="Failed to fetch Discord guilds")
-        return resp.json()
-
-
-async def _ensure_guild_member(discord_id: str) -> None:
-    if not GUILD_ID or not BOT_TOKEN:
-        return
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        resp = await client.get(
-            f"{DISCORD_API}/guilds/{GUILD_ID}/members/{discord_id}",
-            headers={"Authorization": f"Bot {BOT_TOKEN}"},
-        )
-        if resp.status_code == 404:
-            raise HTTPException(
-                status_code=403,
-                detail="Вы должны быть участником Discord-сервера Мини-станции",
+        member = await discord.is_guild_member(discord_id)
+        if member is True:
+            return None
+        if member is False:
+            return _page(
+                settings,
+                "Нужен Discord сервер",
+                "Вы должны быть участником Discord-сервера Мини-станции",
+                403,
             )
-        if resp.status_code != 200:
-            raise HTTPException(status_code=502, detail="Discord guild membership check failed")
+        return _page(
+            settings,
+            "Нужен Discord сервер",
+            "Не удалось подтвердить участие в Discord-сервере. "
+            "Разрешите приложению видеть ваши сервера в настройках Discord.",
+            403,
+        )
+    except DiscordApiError as exc:
+        return _page(settings, "Ошибка Discord", str(exc), 502)
 
 
-async def _assign_auth_role(discord_id: str) -> None:
-    if not GUILD_ID or not BOT_TOKEN or not AUTH_DISCORD_ROLE_ID:
-        return
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        await client.put(
-            f"{DISCORD_API}/guilds/{GUILD_ID}/members/{discord_id}/roles/{AUTH_DISCORD_ROLE_ID}",
-            headers={"Authorization": f"Bot {BOT_TOKEN}"},
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    settings = get_settings()
+    init_db()
+    discord = DiscordClient(
+        client_id=settings.client_id,
+        client_secret=settings.client_secret,
+        redirect_uri=settings.redirect_uri,
+        bot_token=settings.bot_token,
+        guild_id=settings.guild_id,
+        auth_role_id=settings.auth_discord_role_id,
+    )
+    await discord.start()
+    app.state.settings = settings
+    app.state.discord = discord
+    if settings.require_guild and settings.guild_id and not settings.bot_token:
+        logger.warning("REQUIRE_GUILD=true but BOT_TOKEN is empty; relying on OAuth guilds list only")
+    logger.info(
+        "SS14 Discord Auth v%s ready; databases=%s",
+        __version__,
+        ", ".join(db.name for db in settings.databases),
+    )
+    yield
+    await discord.stop()
+
+
+def create_app() -> FastAPI:
+    settings = get_settings()
+    application = FastAPI(
+        title="SS14 Discord Auth",
+        version=__version__,
+        description="Discord linking service for Мини-станция / Space Station 14",
+        lifespan=lifespan,
+        docs_url=None if settings.disable_docs else "/docs",
+        redoc_url=None if settings.disable_docs else "/redoc",
+        openapi_url=None if settings.disable_docs else "/openapi.json",
+    )
+    application.add_middleware(SecurityHeadersMiddleware)
+
+    @application.get("/health", response_model=HealthResponse)
+    def health():
+        db_status = ping_databases()
+        ok = bool(db_status) and all(db_status.values())
+        payload = HealthResponse(ok=ok, version=__version__, databases=db_status)
+        return JSONResponse(
+            content=payload.model_dump(),
+            status_code=200 if ok else 503,
         )
 
+    @application.get("/login/{user_id}")
+    def generate_auth_link_get(request: Request, user_id: str):
+        settings = request.app.state.settings
+        if not limiter.hit(f"login:{_client_ip(request)}", limit=settings.rate_limit_login):
+            raise HTTPException(status_code=429, detail="Too many requests")
+        uid = _parse_user_id(user_id)
+        return RedirectResponse(_oauth_url(settings, uid), status_code=307)
 
-def _error_page(title: str, message: str, status_code: int = 400) -> HTMLResponse:
-    html = f"""<!doctype html>
-<html lang="ru"><head><meta charset="utf-8"><title>{title}</title>
-<style>
-body{{font-family:system-ui,sans-serif;background:#0f1419;color:#e7ecf3;display:grid;place-items:center;min-height:100vh;margin:0}}
-main{{max-width:28rem;padding:2rem;border:1px solid #2a3441;border-radius:12px;background:#161c24}}
-a{{color:#6cb6ff}}
-</style></head>
-<body><main><h1>{title}</h1><p>{message}</p>
-<p><a href="{SITE_PUBLIC_URL}">Перейти на сайт</a></p></main></body></html>"""
-    return HTMLResponse(html, status_code=status_code)
+    @application.get("/callback")
+    async def discord_callback(
+        request: Request,
+        code: str | None = None,
+        state: str | None = None,
+        error: str | None = None,
+        error_description: str | None = None,
+    ):
+        settings: Settings = request.app.state.settings
+        discord: DiscordClient = request.app.state.discord
+
+        if not limiter.hit(f"callback:{_client_ip(request)}", limit=settings.rate_limit_callback):
+            return _page(settings, "Слишком много запросов", "Подождите немного и попробуйте снова.", 429)
+
+        if error:
+            return _page(settings, "Авторизация отменена", error_description or error, 400)
+        if not code or not state:
+            return _page(settings, "Ошибка авторизации", "Нет code/state от Discord", 400)
+
+        try:
+            uid = _parse_user_id(parse_oauth_state(state, settings.game_auth_secret, consume=True))
+        except (ValueError, HTTPException):
+            return _page(settings, "Ошибка авторизации", "Некорректный или просроченный state", 400)
+
+        try:
+            access_token = await discord.exchange_code(code)
+            user = await discord.fetch_user(access_token)
+        except DiscordApiError as exc:
+            logger.warning("Discord OAuth failed: %s", exc)
+            return _page(settings, "Ошибка Discord", str(exc), 400)
+
+        discord_id = str(user["id"])
+        username = str(user.get("global_name") or user.get("username") or discord_id)
+        avatar = user.get("avatar")
+
+        guild_error = await _ensure_required_guild(
+            settings=settings,
+            discord=discord,
+            access_token=access_token,
+            discord_id=discord_id,
+        )
+        if guild_error is not None:
+            return guild_error
+
+        try:
+            link_account_all(uid, int(discord_id))
+        except LinkConflictError as exc:
+            return _page(settings, "Привязка невозможна", str(exc), 409)
+        except Exception:
+            logger.exception("Link failed for user=%s discord=%s", uid, discord_id)
+            return _page(settings, "Ошибка привязки", "Не удалось сохранить привязку. Попробуйте позже.", 500)
+
+        try:
+            await discord.assign_auth_role(discord_id)
+        except Exception:
+            logger.exception("Failed to assign Discord auth role to %s", discord_id)
+
+        token = create_site_login_token(
+            secret=settings.game_auth_secret,
+            discord_id=discord_id,
+            username=username,
+            avatar=avatar if isinstance(avatar, str) else None,
+            ss14_user_id=str(uid),
+        )
+        target = f"{settings.site_public_url}{settings.site_login_path}?{urlencode({'token': token})}"
+
+        if settings.show_success_page:
+            return success_page(
+                site_url=settings.site_public_url,
+                redirect_url=target,
+                username=username,
+            )
+        return RedirectResponse(target, status_code=302)
+
+    @application.post("/{user_id}", response_model=LinkResponse)
+    def generate_auth_link_post(request: Request, user_id: str, key: str = Query(...)):
+        settings = request.app.state.settings
+        _require_api_key(settings, key)
+        uid = _parse_user_id(user_id)
+        url = _oauth_url(settings, uid)
+        return LinkResponse(Url=url, Qrcode=_qr_png_base64(url))
+
+    @application.get("/{user_id}", response_model=AuthInfoResponse)
+    def check_verification_status(
+        request: Request,
+        user_id: str,
+        key: str | None = Query(default=None),
+    ):
+        settings = request.app.state.settings
+        if settings.require_check_api_key:
+            _require_api_key(settings, key)
+        uid = _parse_user_id(user_id)
+        return AuthInfoResponse(IsLinked=is_linked_any(uid))
+
+    return application
 
 
-@app.get("/login/{user_id}")
-def generate_auth_link_get(user_id: str):
-    uid = _parse_user_id(user_id)
-    return RedirectResponse(_oauth_url(uid), status_code=307)
-
-
-@app.get("/callback")
-async def discord_callback(code: str, state: str):
-    uid = _parse_user_id(state)
-    access_token = await _exchange_code(code)
-    user = await _fetch_discord_user(access_token)
-    discord_id = str(user["id"])
-    username = user.get("global_name") or user.get("username") or discord_id
-    avatar = user.get("avatar")
-
-    if REQUIRE_GUILD and GUILD_ID:
-        guilds = await _fetch_user_guilds(access_token)
-        if not any(str(g.get("id")) == GUILD_ID for g in guilds):
-            try:
-                await _ensure_guild_member(discord_id)
-            except HTTPException as exc:
-                return _error_page(
-                    "Нужен Discord сервер",
-                    str(exc.detail),
-                    status_code=exc.status_code,
-                )
-
-    try:
-        link_account_all(uid, int(discord_id))
-    except LinkConflictError as exc:
-        return _error_page("Привязка невозможна", str(exc), status_code=409)
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Link failed")
-        return _error_page("Ошибка привязки", f"Не удалось сохранить привязку: {exc}", 500)
-
-    try:
-        await _assign_auth_role(discord_id)
-    except Exception:
-        pass
-
-    token = create_site_login_token(
-        secret=GAME_AUTH_SECRET,
-        discord_id=discord_id,
-        username=username,
-        avatar=avatar,
-        ss14_user_id=str(uid),
-    )
-    target = f"{SITE_PUBLIC_URL}{SITE_LOGIN_PATH}?token={token}"
-    return RedirectResponse(target, status_code=302)
-
-
-@app.post("/{user_id}", response_model=LinkResponse)
-def generate_auth_link_post(user_id: str, key: str = Query(...)):
-    _require_api_key(key)
-    uid = _parse_user_id(user_id)
-    url = _oauth_url(uid)
-    return LinkResponse(Url=url, Qrcode=_qr_png_base64(url))
-
-
-@app.get("/{user_id}", response_model=AuthInfoResponse)
-def check_verification_status(user_id: str):
-    uid = _parse_user_id(user_id)
-    return AuthInfoResponse(IsLinked=is_linked_any(uid))
+app = create_app()
 
 
 def main() -> None:
+    settings = get_settings()
     uvicorn.run(
         "discord_auth_server:app",
         host=settings.host,
         port=settings.port,
         reload=False,
+        proxy_headers=settings.trust_proxy,
+        forwarded_allow_ips=settings.forwarded_allow_ips,
     )
 
 

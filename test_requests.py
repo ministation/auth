@@ -17,11 +17,14 @@ API_KEY = sys.argv[2] if len(sys.argv) > 2 else os.getenv("API_KEY", "")
 
 def main() -> None:
     with httpx.Client(base_url=BASE, timeout=10.0, follow_redirects=False) as client:
+        health = client.get("/health")
+        print("GET /health:", health.status_code, health.text)
+
         check = client.get(f"/{USER_ID}")
         print("GET /{user_id}:", check.status_code, check.text)
 
         link = client.post(f"/{USER_ID}", params={"key": API_KEY})
-        print("POST /{user_id}:", link.status_code, link.json().get("Url"))
+        print("POST /{user_id}:", link.status_code, link.json().get("Url") if link.headers.get("content-type", "").startswith("application/json") else link.text)
 
         login = client.get(f"/login/{USER_ID}")
         print("GET /login/{user_id}:", login.status_code, login.headers.get("location"))

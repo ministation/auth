@@ -1,0 +1,12 @@
+[project]
+name = "discord-auth-ss14"
+version = "1.4.0"
+description = "Discord linking service for Мини-станция / Space Station 14"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary - Mini-Station. See LICENSE." }
+authors = [{ name = "Мини-станция" }]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

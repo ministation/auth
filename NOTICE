@@ -1,0 +1,13 @@
+Third-party dependencies
+========================
+
+This project uses third-party packages installed via pip (see requirements.txt).
+Those packages remain under their own licenses (MIT, BSD, Apache-2.0, etc.).
+
+Examples (non-exhaustive):
+  - FastAPI / Starlette / Uvicorn
+  - SQLAlchemy / psycopg2-binary
+  - httpx / pydantic / qrcode / Pillow / python-dotenv
+
+The Mini-Station proprietary LICENSE applies only to original code in this
+repository, not to third-party dependencies.

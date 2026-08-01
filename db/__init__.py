@@ -1,6 +1,6 @@
 from db.database import get_session, init_db
 from db.models import DiscordAuth
-from db.multi import is_linked_any, link_account_all
+from db.multi import is_linked_any, link_account_all, ping_databases
 
 __all__ = [
     "DiscordAuth",
@@ -8,4 +8,5 @@ __all__ = [
     "init_db",
     "is_linked_any",
     "link_account_all",
+    "ping_databases",
 ]

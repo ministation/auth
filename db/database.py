@@ -1,13 +1,16 @@
+# Copyright (c) 2024–2026 Мини-станция (Mini-Station). All rights reserved.
+# See LICENSE for terms.
+
 from __future__ import annotations
 
-from collections.abc import Generator, Iterable
+from collections.abc import Generator
 from contextlib import contextmanager
 
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
-from config_loader import load_settings
+from settings import get_settings
 
 _engines: dict[str, Engine] = {}
 _session_makers: dict[str, sessionmaker[Session]] = {}
@@ -19,13 +22,18 @@ def init_db() -> None:
     if _engines:
         return
 
-    settings = load_settings()
+    settings = get_settings()
     engines: dict[str, Engine] = {}
     makers: dict[str, sessionmaker[Session]] = {}
     order: list[str] = []
 
     for db in settings.databases:
-        engine = create_engine(db.url, pool_pre_ping=True)
+        engine = create_engine(
+            db.url,
+            pool_pre_ping=True,
+            pool_size=5,
+            max_overflow=10,
+        )
         engines[db.name] = engine
         makers[db.name] = sessionmaker(bind=engine, autocommit=False, autoflush=False)
         order.append(db.name)
@@ -66,11 +74,3 @@ def get_session(db_name: str | None = None) -> Generator[Session, None, None]:
         raise
     finally:
         session.close()
-
-
-def iter_sessions(db_names: Iterable[str] | None = None) -> Generator[tuple[str, Session], None, None]:
-    """Yield open sessions for each DB. Caller must close / use context carefully."""
-    names = list(db_names) if db_names is not None else database_names()
-    for name in names:
-        with get_session(name) as session:
-            yield name, session
