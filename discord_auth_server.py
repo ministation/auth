@@ -33,7 +33,7 @@ from security import (
 )
 from settings import Settings, get_settings
 
-__version__ = "1.4.0"
+__version__ = "1.4.2"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -100,15 +100,22 @@ async def _ensure_required_guild(
 ):
     if not settings.require_guild:
         return None
-    if not settings.guild_id:
-        return _page(settings, "Конфигурация", "REQUIRE_GUILD включён, но GUILD_ID не задан", 500)
+    required = settings.required_guild_ids
+    if not required:
+        return _page(
+            settings,
+            "Конфигурация",
+            "REQUIRE_GUILD включён, но не задан ни один GUILD_ID / AUTH_DISCORD_ROLES",
+            500,
+        )
 
     try:
         guilds = await discord.fetch_guilds(access_token)
-        if any(str(g.get("id")) == settings.guild_id for g in guilds):
+        user_guild_ids = {str(g.get("id")) for g in guilds}
+        if any(gid in user_guild_ids for gid in required):
             return None
 
-        member = await discord.is_guild_member(discord_id)
+        member = await discord.is_member_of_any(discord_id, required)
         if member is True:
             return None
         if member is False:
@@ -138,18 +145,20 @@ async def lifespan(app: FastAPI):
         client_secret=settings.client_secret,
         redirect_uri=settings.redirect_uri,
         bot_token=settings.bot_token,
+        auth_roles=[(t.guild_id, t.role_id) for t in settings.auth_roles],
         guild_id=settings.guild_id,
         auth_role_id=settings.auth_discord_role_id,
     )
     await discord.start()
     app.state.settings = settings
     app.state.discord = discord
-    if settings.require_guild and settings.guild_id and not settings.bot_token:
+    if settings.require_guild and settings.required_guild_ids and not settings.bot_token:
         logger.warning("REQUIRE_GUILD=true but BOT_TOKEN is empty; relying on OAuth guilds list only")
     logger.info(
-        "SS14 Discord Auth v%s ready; databases=%s",
+        "SS14 Discord Auth v%s ready; databases=%s; auth_roles=%s",
         __version__,
         ", ".join(db.name for db in settings.databases),
+        ", ".join(f"{t.guild_id}:{t.role_id}" for t in settings.auth_roles) or "(none)",
     )
     yield
     await discord.stop()
@@ -238,10 +247,7 @@ def create_app() -> FastAPI:
             logger.exception("Link failed for user=%s discord=%s", uid, discord_id)
             return _page(settings, "Ошибка привязки", "Не удалось сохранить привязку. Попробуйте позже.", 500)
 
-        try:
-            await discord.assign_auth_role(discord_id)
-        except Exception:
-            logger.exception("Failed to assign Discord auth role to %s", discord_id)
+        await discord.assign_auth_role(discord_id)
 
         token = create_site_login_token(
             secret=settings.game_auth_secret,

@@ -53,8 +53,8 @@ def success_page(*, site_url: str, redirect_url: str, username: str) -> HTMLResp
         tone="success",
         redirect_url=redirect_url,
         cta_href=redirect_url,
-        cta_label="Перейти сейчас",
-        redirect_delay_ms=1400,
+        cta_label="Перейти на сайт",
+        redirect_delay_ms=1600,
     )
 
 
@@ -69,7 +69,7 @@ def _page(
     cta_href: str,
     cta_label: str,
     redirect_url: str | None = None,
-    redirect_delay_ms: int = 1400,
+    redirect_delay_ms: int = 1600,
 ) -> HTMLResponse:
     safe_title = html.escape(title)
     safe_eyebrow = html.escape(eyebrow)
@@ -80,20 +80,45 @@ def _page(
     if tone == "success":
         icon = "✓"
         status_class = "status--ok"
+        btn_class = "btn btn--accent"
     else:
         icon = "!"
         status_class = "status--err"
+        btn_class = "btn btn--discord"
 
-    refresh = ""
+    # One navigation only: JS timer OR button click (guarded). No meta-refresh.
     script = ""
     if redirect_url:
-        safe_refresh = html.escape(redirect_url, quote=True)
-        refresh = f'<meta http-equiv="refresh" content="{max(1, redirect_delay_ms // 1000)};url={safe_refresh}">'
-        script = (
-            "<script>"
-            f"setTimeout(function(){{location.replace({json.dumps(redirect_url)});}}, {int(redirect_delay_ms)});"
-            "</script>"
+        script = f"""
+<script>
+(function () {{
+  var target = {json.dumps(redirect_url)};
+  var gone = false;
+  function go(e) {{
+    if (gone) {{
+      if (e) e.preventDefault();
+      return false;
+    }}
+    gone = true;
+    if (e) e.preventDefault();
+    location.replace(target);
+    return false;
+  }}
+  window.__authGo = go;
+  setTimeout(function () {{ go(); }}, {int(redirect_delay_ms)});
+}})();
+</script>
+"""
+
+    # Keep token out of href so browser prefetch / link scanners cannot burn it.
+    if redirect_url:
+        cta_attrs = (
+            f' href="{html.escape(site_url, quote=True)}"'
+            ' onclick="return window.__authGo ? window.__authGo(event) : true;"'
+            ' rel="nofollow noopener"'
         )
+    else:
+        cta_attrs = f' href="{safe_cta_href}"'
 
     page = f"""<!doctype html>
 <html lang="ru" data-theme="dark">
@@ -101,7 +126,6 @@ def _page(
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="robots" content="noindex,nofollow">
-  {refresh}
   <title>{safe_title} · Мини-станция</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -114,17 +138,21 @@ def _page(
       --panel: #141c33;
       --panel-2: #0f1628;
       --border: #283355;
+      --border-strong: #3d4d7a;
       --ink: #e9eef9;
       --muted: #9aa8c6;
       --accent: #ffb020;
       --accent-deep: #e68900;
       --discord: #5865F2;
+      --discord-deep: #3d46c9;
       --success: #38c273;
       --danger: #ef6a5e;
       --grad-accent: linear-gradient(135deg, #ffd54f 0%, #ff9800 48%, #ff6d00 100%);
       --shadow-hard: 0 4px 0 rgba(0, 0, 0, 0.35), 0 12px 28px rgba(0, 0, 0, 0.35);
-      --shadow-btn: 0 3px 0 rgba(0, 0, 0, 0.45);
+      --shadow-btn: 0 3px 0 rgba(0, 0, 0, 0.4);
+      --shadow-btn-color: 0 3px 0 rgba(0, 0, 0, 0.45);
       --radius: 10px;
+      --transition: 0.2s ease;
     }}
     *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
     body {{
@@ -135,6 +163,7 @@ def _page(
       font-family: var(--font-body);
       color: var(--ink);
       background: var(--bg);
+      line-height: 1.55;
       -webkit-font-smoothing: antialiased;
     }}
     body::before {{
@@ -155,20 +184,15 @@ def _page(
       filter: blur(64px);
       pointer-events: none;
       z-index: -1;
-      opacity: .7;
+      opacity: .72;
     }}
-    .glow-1 {{
-      width: 320px; height: 320px; top: 8%; left: 6%;
-      background: rgba(255, 200, 46, 0.22);
-    }}
-    .glow-2 {{
-      width: 280px; height: 280px; right: 8%; bottom: 12%;
-      background: rgba(255, 140, 40, 0.16);
-    }}
+    .glow-1 {{ width: 320px; height: 320px; top: 8%; left: 6%; background: rgba(255, 200, 46, 0.28); }}
+    .glow-2 {{ width: 280px; height: 280px; right: 8%; bottom: 12%; background: rgba(255, 140, 40, 0.18); }}
     .shell {{
-      width: min(100%, 440px);
+      width: min(100%, 420px);
       display: grid;
-      gap: 18px;
+      gap: 16px;
+      justify-items: stretch;
     }}
     .brand {{
       display: flex;
@@ -179,23 +203,22 @@ def _page(
       color: var(--ink);
     }}
     .brand-mark {{
-      width: 42px;
-      height: 42px;
+      width: 40px;
+      height: 40px;
       border-radius: 10px;
       display: grid;
       place-items: center;
       background: var(--grad-accent);
-      box-shadow: var(--shadow-btn);
+      border: 2px solid var(--accent-deep);
+      box-shadow: var(--shadow-btn-color);
       font-family: var(--font-pixel);
-      font-size: 0.72rem;
+      font-size: 0.62rem;
       color: #1a1205;
-      font-weight: 700;
     }}
     .brand h1 {{
       font-family: var(--font-pixel);
-      font-size: 0.78rem;
-      line-height: 1.4;
-      letter-spacing: 0.02em;
+      font-size: 0.72rem;
+      line-height: 1.45;
     }}
     .brand h1 span {{ color: var(--accent); }}
     .card {{
@@ -203,71 +226,95 @@ def _page(
       border: 2px solid var(--border);
       border-radius: var(--radius);
       box-shadow: var(--shadow-hard);
-      padding: 28px 24px 24px;
+      padding: 28px 22px 22px;
       text-align: center;
     }}
     .status {{
-      width: 64px;
-      height: 64px;
-      margin: 0 auto 18px;
+      width: 58px;
+      height: 58px;
+      margin: 0 auto 16px;
       border-radius: 50%;
       display: grid;
       place-items: center;
       font-family: var(--font-pixel);
-      font-size: 1.2rem;
-      border: 3px solid transparent;
+      font-size: 1.05rem;
+      border: 2px solid rgba(255,255,255,0.12);
     }}
     .status--ok {{
       color: #0d2a18;
       background: linear-gradient(145deg, #6ee7a4, var(--success));
-      box-shadow: 0 0 0 6px rgba(56, 194, 115, 0.15), var(--shadow-btn);
+      box-shadow: 0 0 0 5px rgba(56, 194, 115, 0.14), var(--shadow-btn);
     }}
     .status--err {{
       color: #2a0d0b;
       background: linear-gradient(145deg, #ff9a90, var(--danger));
-      box-shadow: 0 0 0 6px rgba(239, 106, 94, 0.15), var(--shadow-btn);
+      box-shadow: 0 0 0 5px rgba(239, 106, 94, 0.14), var(--shadow-btn);
     }}
     .eyebrow {{
       font-family: var(--font-pixel);
-      font-size: 0.52rem;
+      font-size: 0.48rem;
       color: var(--accent);
       letter-spacing: 0.04em;
-      margin-bottom: 12px;
+      margin-bottom: 10px;
       text-transform: uppercase;
     }}
     .card h2 {{
       font-family: var(--font-pixel);
-      font-size: 0.95rem;
-      line-height: 1.45;
-      margin-bottom: 14px;
+      font-size: 0.86rem;
+      line-height: 1.5;
+      margin-bottom: 12px;
     }}
-    .card p {{
+    .card .msg {{
       color: var(--muted);
-      font-size: 1.02rem;
+      font-size: 0.98rem;
       line-height: 1.55;
-      margin-bottom: 22px;
+      margin-bottom: 20px;
     }}
-    .card p strong {{ color: var(--ink); font-weight: 700; }}
-    .cta {{
+    .card .msg strong {{ color: var(--ink); font-weight: 700; }}
+    .actions {{
+      display: flex;
+      justify-content: center;
+    }}
+    .btn {{
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      gap: 8px;
+      gap: 10px;
       min-height: 44px;
-      padding: 0 18px;
-      border-radius: 8px;
-      border: 2px solid var(--accent-deep);
-      background: var(--grad-accent);
-      color: #1a1205;
+      min-width: 210px;
+      padding: 8px 16px;
+      border-radius: var(--radius);
+      border: 2px solid transparent;
       text-decoration: none;
-      font-family: var(--font-pixel);
-      font-size: 0.58rem;
-      line-height: 1.3;
-      box-shadow: var(--shadow-btn);
-      transition: transform .15s ease, filter .15s ease;
+      font-family: var(--font-body);
+      font-size: 0.82rem;
+      font-weight: 700;
+      letter-spacing: 0.01em;
+      white-space: nowrap;
+      box-shadow: var(--shadow-btn-color);
+      transition: background var(--transition), transform var(--transition), filter var(--transition);
+      cursor: pointer;
+      user-select: none;
     }}
-    .cta:hover {{ transform: translateY(-1px); filter: brightness(1.05); }}
-    .cta:active {{ transform: translateY(1px); box-shadow: none; }}
+    .btn:hover {{ transform: translateY(-1px); }}
+    .btn:active {{ transform: translateY(1px); box-shadow: none; }}
+    .btn--accent {{
+      background: var(--grad-accent);
+      border-color: var(--accent-deep);
+      color: #1a1205;
+    }}
+    .btn--accent:hover {{ filter: brightness(1.05); color: #1a1205; }}
+    .btn--discord {{
+      background: var(--discord);
+      border-color: var(--discord-deep);
+      color: #fff;
+    }}
+    .btn--discord:hover {{ background: #6b76ff; color: #fff; }}
+    .hint {{
+      margin-top: 14px;
+      color: var(--muted);
+      font-size: 0.82rem;
+    }}
     .meta {{
       text-align: center;
       color: var(--muted);
@@ -276,28 +323,9 @@ def _page(
     .meta a {{
       color: var(--accent);
       text-decoration: none;
-      font-weight: 600;
+      font-weight: 700;
     }}
     .meta a:hover {{ text-decoration: underline; }}
-    .discord-chip {{
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      margin-top: 16px;
-      padding: 6px 10px;
-      border-radius: 999px;
-      background: rgba(88, 101, 242, 0.16);
-      border: 1px solid rgba(88, 101, 242, 0.35);
-      color: #c7cdff;
-      font-size: 0.85rem;
-    }}
-    .discord-chip i {{
-      width: 14px;
-      height: 14px;
-      border-radius: 4px;
-      background: var(--discord);
-      display: inline-block;
-    }}
   </style>
 </head>
 <body>
@@ -312,9 +340,11 @@ def _page(
       <div class="status {status_class}" aria-hidden="true">{icon}</div>
       <div class="eyebrow">{safe_eyebrow}</div>
       <h2>{safe_title}</h2>
-      <p>{message}</p>
-      <a class="cta" href="{safe_cta_href}">{safe_cta_label}</a>
-      <div class="discord-chip"><i></i> Discord · SS14</div>
+      <div class="msg">{message}</div>
+      <div class="actions">
+        <a class="{btn_class}"{cta_attrs}>{safe_cta_label}</a>
+      </div>
+      {"<p class='hint'>Автоматический переход через пару секунд…</p>" if redirect_url else ""}
     </main>
     <p class="meta"><a href="{safe_site}">ministation.ru</a></p>
   </div>

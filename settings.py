@@ -111,6 +111,82 @@ def _load_databases() -> list[DatabaseConfig]:
 
 
 @dataclass(frozen=True)
+class GuildRoleTarget:
+    """Discord guild + auth role to assign after successful SS14 link."""
+
+    guild_id: str
+    role_id: str
+
+
+def _parse_snowflake_pairs(raw: str) -> list[tuple[str, str]]:
+    """Parse 'guild:role,guild:role' or whitespace-separated pairs."""
+    pairs: list[tuple[str, str]] = []
+    for chunk in re.split(r"[\s,;]+", raw.strip()):
+        if not chunk:
+            continue
+        if ":" not in chunk:
+            raise RuntimeError(
+                "AUTH_DISCORD_ROLES entries must look like guildId:roleId "
+                f"(got {chunk!r})"
+            )
+        guild_id, role_id = chunk.split(":", 1)
+        guild_id, role_id = guild_id.strip(), role_id.strip()
+        if not guild_id.isdigit() or not role_id.isdigit():
+            raise RuntimeError(
+                f"AUTH_DISCORD_ROLES entry must be numeric snowflakes (got {chunk!r})"
+            )
+        pairs.append((guild_id, role_id))
+    return pairs
+
+
+def _load_auth_roles() -> list[GuildRoleTarget]:
+    """
+    Role targets on one or more Discord servers.
+
+    Preferred:
+      AUTH_DISCORD_ROLES=guild1:role1,guild2:role2
+
+    Legacy / extra pairs also accepted:
+      GUILD_ID + AUTH_DISCORD_ROLE_ID
+      GUILD2_ID + AUTH_DISCORD_ROLE_ID_2
+    """
+    seen: set[tuple[str, str]] = set()
+    targets: list[GuildRoleTarget] = []
+
+    def add(guild_id: str, role_id: str) -> None:
+        guild_id, role_id = guild_id.strip(), role_id.strip()
+        if not guild_id or not role_id:
+            return
+        key = (guild_id, role_id)
+        if key in seen:
+            return
+        if not guild_id.isdigit() or not role_id.isdigit():
+            raise RuntimeError(f"Invalid guild/role snowflake: {guild_id}/{role_id}")
+        seen.add(key)
+        targets.append(GuildRoleTarget(guild_id=guild_id, role_id=role_id))
+
+    roles_raw = os.getenv("AUTH_DISCORD_ROLES", "").strip()
+    if roles_raw:
+        for guild_id, role_id in _parse_snowflake_pairs(roles_raw):
+            add(guild_id, role_id)
+
+    add(os.getenv("GUILD_ID", ""), os.getenv("AUTH_DISCORD_ROLE_ID", ""))
+    add(os.getenv("GUILD2_ID", ""), os.getenv("AUTH_DISCORD_ROLE_ID_2", ""))
+
+    # Extra GUILD{N}_ID / AUTH_DISCORD_ROLE_ID_{N} for N>=3
+    for key in list(os.environ):
+        match = re.match(r"^GUILD(\d+)_ID$", key, re.IGNORECASE)
+        if not match:
+            continue
+        n = int(match.group(1))
+        if n < 3:
+            continue
+        add(os.getenv(key, ""), os.getenv(f"AUTH_DISCORD_ROLE_ID_{n}", ""))
+
+    return targets
+
+
+@dataclass(frozen=True)
 class Settings:
     bot_token: str
     api_key: str
@@ -119,6 +195,8 @@ class Settings:
     redirect_uri: str
     guild_id: str
     auth_discord_role_id: str | None
+    auth_roles: list[GuildRoleTarget]
+    required_guild_ids: list[str]
     site_public_url: str
     site_login_path: str
     game_auth_secret: str
@@ -150,15 +228,34 @@ def get_settings() -> Settings:
     ):
         raise RuntimeError("REDIRECT_URI must be an http(s) URL")
 
-    role_raw = os.getenv("AUTH_DISCORD_ROLE_ID", "").strip()
+    auth_roles = _load_auth_roles()
+    guild_id = os.getenv("GUILD_ID", "").strip()
+    if not guild_id and auth_roles:
+        guild_id = auth_roles[0].guild_id
+    role_id = os.getenv("AUTH_DISCORD_ROLE_ID", "").strip() or None
+    if role_id is None and auth_roles:
+        role_id = auth_roles[0].role_id
+
+    required_guild_ids = list(dict.fromkeys(
+        [*(t.guild_id for t in auth_roles), *([guild_id] if guild_id else [])]
+    ))
+    # Optional: REQUIRE_GUILD_IDS=id1,id2 overrides membership check set
+    require_raw = os.getenv("REQUIRE_GUILD_IDS", "").strip()
+    if require_raw:
+        required_guild_ids = [
+            g.strip() for g in re.split(r"[\s,;]+", require_raw) if g.strip().isdigit()
+        ]
+
     return Settings(
         bot_token=_env("BOT_TOKEN"),
         api_key=_require_min_len("API_KEY", _env("API_KEY"), 8),
         client_id=_env("CLIENT_ID"),
         client_secret=_env("CLIENT_SECRET"),
         redirect_uri=redirect_uri,
-        guild_id=os.getenv("GUILD_ID", "").strip(),
-        auth_discord_role_id=role_raw or None,
+        guild_id=guild_id,
+        auth_discord_role_id=role_id,
+        auth_roles=auth_roles,
+        required_guild_ids=required_guild_ids,
         site_public_url=_env("SITE_PUBLIC_URL", "https://ministation.ru").rstrip("/"),
         site_login_path=site_login_path,
         game_auth_secret=_require_min_len("GAME_AUTH_SECRET", _env("GAME_AUTH_SECRET"), 24),

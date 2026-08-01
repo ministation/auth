@@ -8,7 +8,7 @@
 ## Возможности
 
 - Corvax-совместимый API: `POST /{user_id}?key=…`, `GET /{user_id}`, `GET /login/{user_id}`
-- Discord OAuth + проверка гильдии + выдача роли
+- Discord OAuth + проверка гильдии + выдача роли на один или несколько серверов (`AUTH_DISCORD_ROLES` / `GUILD2_ID`)
 - Запись привязки сразу в `DB1`, `DB2`, …
 - Жёстко: 1 Discord ID → 1 игровой аккаунт
 - Редирект на сайт с одноразовым HMAC-токеном
