@@ -33,7 +33,7 @@ from security import (
 )
 from settings import Settings, get_settings
 
-__version__ = "1.4.3"
+__version__ = "1.4.4"
 
 logging.basicConfig(
     level=logging.INFO,

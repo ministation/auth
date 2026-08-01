@@ -5,6 +5,7 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .env
+.sync_auth_roles_*.json
 *.log
 .idea/
 .vscode/

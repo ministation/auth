@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Sequence
 
@@ -151,12 +152,14 @@ class DiscordClient:
         discord_id: str,
         *,
         only_guild_ids: Sequence[str] | None = None,
+        quiet_not_member: bool = False,
+        max_retries: int = 6,
     ) -> dict[str, str]:
         """
         Assign auth role on configured guilds.
 
-        Returns map guild_id -> status (ok / skip / http_NNN / error).
-        Failures are logged, not raised.
+        Returns map guild_id -> status (ok / not_member / skip / http_NNN / error).
+        Failures are logged, not raised. HTTP 429 is retried using retry_after.
         """
         results: dict[str, str] = {}
         if not self.auth_roles:
@@ -169,29 +172,46 @@ class DiscordClient:
                 results[guild_id] = "skip_no_token"
                 continue
             url = f"{DISCORD_API}/guilds/{guild_id}/members/{discord_id}/roles/{role_id}"
+            headers = {"Authorization": f"Bot {token}"}
+            status = "error"
             try:
-                resp = await self.http.put(
-                    url,
-                    headers={"Authorization": f"Bot {token}"},
-                )
-                if resp.status_code in (200, 204):
-                    results[guild_id] = "ok"
-                    logger.info(
-                        "Assigned auth role %s to %s on guild %s",
-                        role_id,
-                        discord_id,
-                        guild_id,
-                    )
-                elif resp.status_code == 404:
-                    results[guild_id] = "not_member"
-                    logger.warning(
-                        "Cannot assign role %s on guild %s for %s: member not found",
-                        role_id,
-                        guild_id,
-                        discord_id,
-                    )
-                else:
-                    results[guild_id] = f"http_{resp.status_code}"
+                for attempt in range(max_retries + 1):
+                    resp = await self.http.put(url, headers=headers)
+                    if resp.status_code in (200, 204):
+                        status = "ok"
+                        logger.info(
+                            "Assigned auth role %s to %s on guild %s",
+                            role_id,
+                            discord_id,
+                            guild_id,
+                        )
+                        break
+                    if resp.status_code == 404:
+                        status = "not_member"
+                        log = logger.debug if quiet_not_member else logger.info
+                        log(
+                            "Skip role %s on guild %s for %s: not a guild member",
+                            role_id,
+                            guild_id,
+                            discord_id,
+                        )
+                        break
+                    if resp.status_code == 429 and attempt < max_retries:
+                        retry_after = 1.0
+                        try:
+                            retry_after = float(resp.json().get("retry_after", 1.0))
+                        except Exception:
+                            retry_after = float(resp.headers.get("Retry-After", "1") or 1)
+                        wait = max(0.25, retry_after) + 0.15
+                        logger.warning(
+                            "Rate limited assigning role on guild %s; sleep %.1fs (attempt %s)",
+                            guild_id,
+                            wait,
+                            attempt + 1,
+                        )
+                        await asyncio.sleep(wait)
+                        continue
+                    status = f"http_{resp.status_code}"
                     logger.warning(
                         "Failed to assign role %s on guild %s for %s: HTTP %s %s",
                         role_id,
@@ -200,14 +220,16 @@ class DiscordClient:
                         resp.status_code,
                         resp.text[:200],
                     )
+                    break
             except Exception:
-                results[guild_id] = "error"
+                status = "error"
                 logger.exception(
                     "Error assigning role %s on guild %s for %s",
                     role_id,
                     guild_id,
                     discord_id,
                 )
+            results[guild_id] = status
         return results
 
 
