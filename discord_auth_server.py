@@ -31,9 +31,10 @@ from security import (
     create_site_login_token,
     parse_oauth_state,
 )
+from presence_bot import PresenceBot
 from settings import Settings, get_settings
 
-__version__ = "1.4.6"
+__version__ = "1.4.7"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -152,15 +153,20 @@ async def lifespan(app: FastAPI):
     await discord.start()
     app.state.settings = settings
     app.state.discord = discord
+    presence = PresenceBot(settings)
+    await presence.start()
+    app.state.presence = presence
     if settings.require_guild and settings.required_guild_ids and not settings.bot_token:
         logger.warning("REQUIRE_GUILD=true but BOT_TOKEN is empty; relying on OAuth guilds list only")
     logger.info(
-        "SS14 Discord Auth v%s ready; databases=%s; auth_roles=%s",
+        "SS14 Discord Auth v%s ready; databases=%s; auth_roles=%s; presence=%s",
         __version__,
         ", ".join(db.name for db in settings.databases),
         ", ".join(f"{t.guild_id}:{t.role_id}" for t in settings.auth_roles) or "(none)",
+        settings.ss14_status_url or "off",
     )
     yield
+    await presence.stop()
     await discord.stop()
 
 
