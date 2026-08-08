@@ -245,8 +245,6 @@ class Settings:
     show_success_page: bool
     trust_proxy: bool
     forwarded_allow_ips: str
-    ss14_status_url: str
-    status_update_interval: int
 
 
 @lru_cache(maxsize=1)
@@ -307,8 +305,6 @@ def get_settings() -> Settings:
         show_success_page=_env_bool("SHOW_SUCCESS_PAGE", True),
         trust_proxy=_env_bool("TRUST_PROXY", True),
         forwarded_allow_ips=_env("FORWARDED_ALLOW_IPS", "*"),
-        ss14_status_url=os.getenv("SS14_STATUS_URL", "").strip(),
-        status_update_interval=max(15, int(_env("STATUS_UPDATE_INTERVAL_SECONDS", "60"))),
     )
 
 
